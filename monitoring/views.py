@@ -1,3 +1,4 @@
+import os
 from datetime import timedelta
 from django.utils import timezone
 from rest_framework.views import APIView
@@ -65,15 +66,26 @@ class LiveMonitoringView(APIView):
             "pipeline_id": pipeline.id if pipeline else None,
             "current_flow_rate": current_flow_rate(pipeline),
             "unit": "L/min",
+            "volume_unit": "L",
             "consumption_today": consumption_today(pipeline),
+            "as_of": timezone.now(),
             "sensors": [],
         }
+        now = timezone.now()
+        stale_after = int(os.getenv("TELEMETRY_STALE_SECONDS", "45"))
         if pipeline:
             for s in Sensor.objects.filter(pipeline=pipeline):
                 last = latest_reading_for_sensor(s)
+                age = None
+                fresh = False
+                if last and last.reading_timestamp:
+                    age = (now - last.reading_timestamp).total_seconds()
+                    fresh = age <= stale_after
                 data["sensors"].append({
                     "sensor": s.sensor_identifier,
                     "position": s.sensor_position,
+                    "fresh": fresh,
+                    "reading_age_seconds": int(age) if age is not None else None,
                     "last_reading": FlowReadingSerializer(last).data if last else None,
                 })
         return success_response(data)

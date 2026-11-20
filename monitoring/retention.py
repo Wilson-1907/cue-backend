@@ -1,8 +1,8 @@
 """
-Keep the free-tier DB small: only recent readings for live graphs, then delete.
+Keep the free-tier DB small: recent readings for live graphs, then delete.
 
-Preserves users, devices, sensors, pipelines, valves, settings.
-Prunes FlowReading, DeviceCommunicationLog, ActivityLog, old Consumption rows.
+When water is flowing, store frequently so KPIs are never frozen.
+When quiet (~0), store rarely to save space.
 """
 
 from __future__ import annotations
@@ -29,7 +29,7 @@ def max_readings() -> int:
 
 
 def should_store_reading(sensor, flow_rate, volume) -> bool:
-    """Skip near-duplicate quiet readings so we only store what graphs need."""
+    """Store often while flowing; throttle only when both samples are ~0."""
     from monitoring.models import FlowReading
 
     if not getattr(settings, "TELEMETRY_SKIP_DUPES", True):
@@ -45,26 +45,16 @@ def should_store_reading(sensor, flow_rate, volume) -> bool:
         return True
 
     age = (timezone.now() - last.reading_timestamp).total_seconds()
-    # Always keep a sample at least every N seconds for a smooth live chart
-    min_gap = int(getattr(settings, "TELEMETRY_MIN_SAMPLE_SECONDS", 5))
-    if age < min_gap:
-        return False
-
     flow = Decimal(str(flow_rate))
-    vol = Decimal(str(volume))
-    flow_delta = abs((last.flow_rate or Decimal("0")) - flow)
-    vol_delta = abs((last.volume or Decimal("0")) - vol)
+    last_flow = last.flow_rate or Decimal("0")
 
-    # Quiet line (both ~0): keep at most one sample per 60s
-    if flow < Decimal("0.05") and (last.flow_rate or Decimal("0")) < Decimal("0.05"):
-        return age >= 60
+    # Flowing (now or previously): sample every ~2s so live KPIs move
+    flowing_gap = int(getattr(settings, "TELEMETRY_FLOWING_SAMPLE_SECONDS", 2))
+    if flow >= Decimal("0.05") or last_flow >= Decimal("0.05"):
+        return age >= flowing_gap
 
-    # Meaningful change → store
-    if flow_delta >= Decimal("0.15") or vol_delta >= Decimal("0.05"):
-        return True
-
-    # Unchanged flow: sample every 15s max
-    return age >= 15
+    # Quiet line: at most one sample per 60s
+    return age >= 60
 
 
 def prune_telemetry(force: bool = False) -> dict:
@@ -91,7 +81,6 @@ def prune_telemetry(force: bool = False) -> dict:
             reading_timestamp__lt=cutoff
         ).delete()
 
-        # Hard cap: keep newest N rows even inside the window
         ids = list(
             FlowReading.objects.order_by("-reading_timestamp").values_list("id", flat=True)[
                 : max_readings()
@@ -110,7 +99,6 @@ def prune_telemetry(force: bool = False) -> dict:
         deleted["activity_logs"], _ = ActivityLog.objects.filter(
             created_at__lt=cutoff
         ).delete()
-        # Keep at most 7 days of consumption summaries
         cons_cutoff = now - timedelta(days=7)
         deleted["consumption"], _ = Consumption.objects.filter(
             period_end__lt=cons_cutoff
