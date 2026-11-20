@@ -255,9 +255,5 @@ def summary(days: int = 30) -> dict[str, Any]:
             "auto_record_sms": settings.auto_record_sms,
             "auto_record_leak_loss": settings.auto_record_leak_loss,
         },
-        "tips": [
-            "SMS alerts and estimated leak water-loss are recorded automatically.",
-            "Log maintenance after repairs so the report stays complete.",
-            "Adjust unit costs in Finance settings — the system uses them for auto entries.",
-        ],
+        "tips": [],
     }
