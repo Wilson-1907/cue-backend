@@ -316,9 +316,10 @@ def session_on_port(cfg: dict, port: str) -> None:
             log.info("SERIAL: %s", text.encode("ascii", "replace").decode("ascii"))
 
             # Firmware confirms physical valve — keep dashboard in sync
-            if "Water Valve OPEN" in text or text.upper().endswith("VALVE OPEN"):
+            up = text.upper()
+            if "ACK:RESET" in up or "WATER VALVE OPEN" in up or up.endswith("VALVE OPEN"):
                 report_valve_status(cfg, "OPEN")
-            elif "Water Valve CLOSED" in text or "VALVE CLOSED" in text.upper():
+            elif "ACK:VALVE_CLOSED" in up or "WATER VALVE CLOSED" in up or "VALVE_CLOSED" in up:
                 report_valve_status(cfg, "CLOSED")
 
             est = ESTIMATE_RE.match(text)
