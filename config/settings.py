@@ -188,7 +188,8 @@ CORS_ALLOWED_ORIGINS = [
         "CORS_ALLOWED_ORIGINS",
         "http://localhost:3000,http://127.0.0.1:3000,"
         "http://localhost:5173,http://127.0.0.1:5173,"
-        "http://localhost:5500,http://127.0.0.1:5500",
+        "http://localhost:5500,http://127.0.0.1:5500,"
+        "https://cue-pi-orpin.vercel.app",
     ).split(",")
     if o.strip()
 ]
@@ -196,6 +197,11 @@ if _render_host:
     _origin = f"https://{_render_host}"
     if _origin not in CORS_ALLOWED_ORIGINS:
         CORS_ALLOWED_ORIGINS.append(_origin)
+# Split static frontends on Render / Vercel
+CORS_ALLOWED_ORIGIN_REGEXES = [
+    r"^https://[\w-]+\.onrender\.com$",
+    r"^https://[\w-]+\.vercel\.app$",
+]
 
 _REDIS_URL = os.getenv("REDIS_URL", "").strip()
 if _REDIS_URL:
