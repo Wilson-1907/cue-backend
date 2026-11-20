@@ -46,3 +46,6 @@ htmlcov/
 build/
 dist/
 *.egg-info/
+scripts/uno_agent/config.json
+scripts/uno_agent/uno_agent.log
+
