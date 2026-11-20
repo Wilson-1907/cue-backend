@@ -102,7 +102,8 @@ class Command(BaseCommand):
         self.stdout.write("Store the api_key now — it cannot be shown again.")
 
         if options["write_config"]:
-            root = Path(__file__).resolve().parents[4]  # cue-push/
+            # .../backend/iot/management/commands/this.py → parents[3] = backend/
+            root = Path(__file__).resolve().parents[3]
             out = root / "scripts" / "uno_agent" / "config.json"
             out.parent.mkdir(parents=True, exist_ok=True)
             out.write_text(json.dumps(cfg, indent=2), encoding="utf-8")

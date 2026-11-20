@@ -101,8 +101,8 @@ try:
     DATABASES = {
         "default": dj_database_url.config(
             default=_db_url,
-            # Aiven free ~15 slots; don't hold idle connections for 10 minutes
-            conn_max_age=int(os.getenv("DB_CONN_MAX_AGE", "60")),
+            # Aiven free ~15 slots — default close after each request
+            conn_max_age=int(os.getenv("DB_CONN_MAX_AGE", "0")),
             ssl_require=_is_postgres
             and (
                 bool(os.getenv("RENDER"))

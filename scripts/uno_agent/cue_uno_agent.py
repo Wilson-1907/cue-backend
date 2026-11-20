@@ -150,19 +150,22 @@ def probe_port(port: str, baud: int, timeout: float = 2.5) -> bool:
 
 
 def find_uno_port(cfg: dict) -> str | None:
+    forced = (cfg.get("port") or "").strip()
+    # Locked port: never fall through to Bluetooth/AMT COM ports
+    if forced:
+        log.info("Probing locked port %s …", forced)
+        if probe_port(forced, int(cfg["baud"])):
+            return forced
+        return None
+
     candidates = list_candidate_ports(cfg.get("prefer_vid", True))
     if not candidates:
         return None
-    # If user locked a port and it exists, try it first
-    forced = (cfg.get("port") or "").strip()
-    if forced and forced in candidates:
-        candidates = [forced] + [c for c in candidates if c != forced]
     for port in candidates:
         log.info("Probing %s …", port)
         if probe_port(port, int(cfg["baud"])):
             return port
-    # Last resort: first available COM
-    return candidates[0] if candidates else None
+    return None
 
 
 def post_reading(cfg: dict, sensor_id: str, flow: Decimal, volume: Decimal, pulse: int) -> None:
