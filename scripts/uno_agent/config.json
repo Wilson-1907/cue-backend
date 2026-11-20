@@ -1,0 +1,11 @@
+{
+  "api_base": "http://127.0.0.1:8000/api/v1",
+  "device_id": "UNO-KIT-001",
+  "api_key": "i3erovnuZ68-I3bAwBzt8DbY1qUEawSSGoAoNYXDouU",
+  "baud": 9600,
+  "sensor_inlet": "S1",
+  "sensor_outlet": "S2",
+  "scan_interval_sec": 2,
+  "prefer_vid": true,
+  "port": ""
+}
