@@ -53,8 +53,9 @@ def should_store_reading(sensor, flow_rate, volume) -> bool:
     if flow >= Decimal("0.05") or last_flow >= Decimal("0.05"):
         return age >= flowing_gap
 
-    # Quiet line: at most one sample per 60s
-    return age >= 60
+    # Quiet line: still sample often enough that the UI clock/timestamps move
+    quiet_gap = int(getattr(settings, "TELEMETRY_QUIET_SAMPLE_SECONDS", 10))
+    return age >= quiet_gap
 
 
 def prune_telemetry(force: bool = False) -> dict:
