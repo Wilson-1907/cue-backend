@@ -197,11 +197,34 @@ def post_warning(cfg: dict, title: str, message: str, severity: str = "CRITICAL"
         log.exception("warning POST failed")
 
 
+def _post_json(cfg: dict, path: str, payload: dict, timeout: float = 12) -> requests.Response | None:
+    url = cfg["api_base"].rstrip("/") + path
+    try:
+        r = requests.post(url, headers=headers(cfg), json=payload, timeout=timeout)
+        if r.status_code >= 400:
+            log.warning("POST %s → %s %s", path, r.status_code, r.text[:200])
+        return r
+    except Exception:
+        log.exception("POST %s failed", path)
+        return None
+
+
+def report_valve_status(cfg: dict, status: str) -> None:
+    """Push OPEN/CLOSED confirmed by firmware serial text."""
+    status = status.upper().strip()
+    if status not in {"OPEN", "CLOSED"}:
+        return
+    vid = cfg.get("_valve_id") or cfg.get("valve_id") or 1
+    cfg["_valve_id"] = int(vid)
+    _post_json(cfg, f"/iot/valves/{cfg['_valve_id']}/status/", {"status": status})
+
+
 def poll_valve_commands(cfg: dict, ser: serial.Serial) -> None:
-    url = cfg["api_base"] + "/iot/commands/pending/"
+    url = cfg["api_base"].rstrip("/") + "/iot/commands/pending/"
     try:
         r = requests.get(url, headers=headers(cfg), timeout=10)
         if r.status_code >= 400:
+            log.warning("pending commands → %s %s", r.status_code, r.text[:200])
             return
         body = r.json()
         data = body.get("data") or body
@@ -211,16 +234,39 @@ def poll_valve_commands(cfg: dict, ser: serial.Serial) -> None:
             cid = cmd.get("id")
             if action not in {"CLOSE", "OPEN"} or not cid:
                 continue
+            if cmd.get("valve_id"):
+                cfg["_valve_id"] = int(cmd["valve_id"])
+            # Mark received so UI leaves PENDING quickly
+            _post_json(cfg, f"/iot/commands/{cid}/acknowledge/", {})
             line = "CLOSE" if action == "CLOSE" else "RESET"
-            ser.write((line + "\r\n").encode())
-            ser.flush()
-            log.info("TX %s (command %s)", line, cid)
-            requests.post(
-                cfg["api_base"] + f"/iot/commands/{cid}/execute/",
-                headers=headers(cfg),
-                json={"success": True, "message": f"Sent {line} to Uno"},
-                timeout=10,
-            )
+            try:
+                ser.write((line + "\r\n").encode())
+                ser.flush()
+                log.info("TX %s (command %s)", line, cid)
+            except Exception:
+                log.exception("serial TX failed for command %s", cid)
+                _post_json(
+                    cfg,
+                    f"/iot/commands/{cid}/execute/",
+                    {"success": False, "message": "Serial write failed"},
+                )
+                continue
+            # Confirm to API (retry once — free Render can 502 briefly)
+            ok = False
+            for attempt in range(2):
+                resp = _post_json(
+                    cfg,
+                    f"/iot/commands/{cid}/execute/",
+                    {"success": True, "message": f"Sent {line} to Uno"},
+                )
+                if resp is not None and resp.status_code < 400:
+                    ok = True
+                    break
+                time.sleep(1.5)
+            if ok:
+                report_valve_status(cfg, "CLOSED" if action == "CLOSE" else "OPEN")
+            else:
+                log.error("execute confirm failed for command %s — will retry while PENDING", cid)
     except Exception:
         log.exception("valve poll failed")
 
@@ -233,22 +279,30 @@ def session_on_port(cfg: dict, port: str) -> None:
     pending_leak = None
     pending_estimate = None
     last_cmd_poll = 0.0
+    last_heartbeat = 0.0
 
     with serial.Serial(port, baud, timeout=0.25) as ser:
         log.info("Connected %s @ %s — streaming to %s", port, baud, cfg["api_base"])
-        # Heartbeat
-        try:
-            requests.post(
-                cfg["api_base"] + "/iot/heartbeat/",
-                headers=headers(cfg),
-                json={"device_id": cfg["device_id"], "status": "OK", "firmware_version": "uno-agent"},
-                timeout=10,
+
+        def heartbeat() -> None:
+            _post_json(
+                cfg,
+                "/iot/heartbeat/",
+                {
+                    "device_id": cfg["device_id"],
+                    "status": "OK",
+                    "firmware_version": "uno-agent",
+                },
             )
-        except Exception:
-            log.exception("heartbeat failed")
+
+        heartbeat()
+        last_heartbeat = time.time()
 
         while True:
             now = time.time()
+            if now - last_heartbeat >= 25.0:
+                heartbeat()
+                last_heartbeat = now
             if now - last_cmd_poll > 2.0:
                 poll_valve_commands(cfg, ser)
                 last_cmd_poll = now
@@ -260,6 +314,12 @@ def session_on_port(cfg: dict, port: str) -> None:
             if not text:
                 continue
             log.info("SERIAL: %s", text.encode("ascii", "replace").decode("ascii"))
+
+            # Firmware confirms physical valve — keep dashboard in sync
+            if "Water Valve OPEN" in text or text.upper().endswith("VALVE OPEN"):
+                report_valve_status(cfg, "OPEN")
+            elif "Water Valve CLOSED" in text or "VALVE CLOSED" in text.upper():
+                report_valve_status(cfg, "CLOSED")
 
             est = ESTIMATE_RE.match(text)
             if est:
