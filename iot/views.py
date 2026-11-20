@@ -25,6 +25,18 @@ def _persist_reading(device: Device, payload: dict) -> FlowReading:
     sensor = _ensure_sensor(device, payload["sensor_id"])
     if not sensor:
         raise ValueError(f"Unknown sensor {payload['sensor_id']} for this device")
+
+    from monitoring.retention import should_store_reading, prune_telemetry
+
+    # Only persist when needed for live graphs / meaningful change
+    if not should_store_reading(sensor, payload["flow_rate"], payload["volume"]):
+        prune_telemetry()
+        return (
+            FlowReading.objects.filter(sensor=sensor)
+            .order_by("-reading_timestamp")
+            .first()
+        )
+
     try:
         with transaction.atomic():
             reading = FlowReading.objects.create(
@@ -53,6 +65,11 @@ def _persist_reading(device: Device, payload: dict) -> FlowReading:
             evaluate_pipeline(sensor.pipeline)
         except Exception:
             pass
+    # Graph window only — delete older rows so free DB never fills
+    try:
+        prune_telemetry()
+    except Exception:
+        pass
     return reading
 
 class ReadingIngestView(APIView):
@@ -81,9 +98,8 @@ class ReadingIngestView(APIView):
             reading = _persist_reading(device, payload)
         except ValueError as ve:
             return error_response(str(ve), {"sensor_id": [str(ve)]})
+        # Heartbeat via last_communication only — no per-reading log rows (saves DB space)
         device.mark_connected()
-        DeviceCommunicationLog.objects.create(device=device, kind="READING",
-                                              payload={"sensor": payload["sensor_id"]})
         return created_response({"id": reading.id if reading else None}, "Reading recorded")
 
 class BulkReadingsView(APIView):

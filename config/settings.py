@@ -220,6 +220,13 @@ else:
 SERIAL_PORT = os.getenv("SERIAL_PORT", "COM10")
 SERIAL_BAUD = int(os.getenv("SERIAL_BAUD", "9600"))
 
+# Free-tier DB: keep only a short live-graph window, then delete
+TELEMETRY_RETENTION_MINUTES = int(os.getenv("TELEMETRY_RETENTION_MINUTES", "15"))
+TELEMETRY_MAX_READINGS = int(os.getenv("TELEMETRY_MAX_READINGS", "2000"))
+TELEMETRY_MIN_SAMPLE_SECONDS = int(os.getenv("TELEMETRY_MIN_SAMPLE_SECONDS", "5"))
+TELEMETRY_PRUNE_EVERY_SECONDS = int(os.getenv("TELEMETRY_PRUNE_EVERY_SECONDS", "60"))
+TELEMETRY_SKIP_DUPES = os.getenv("TELEMETRY_SKIP_DUPES", "True") == "True"
+
 TEXTSMS_API_URL = os.getenv(
     "TEXTSMS_API_URL", "https://sms.textsms.co.ke/api/services/sendsms/"
 )

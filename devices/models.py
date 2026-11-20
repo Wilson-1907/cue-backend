@@ -33,8 +33,16 @@ class Device(TimeStampedModel):
 
     def mark_connected(self):
         from django.utils import timezone
+        now = timezone.now()
+        # Avoid a DB write on every reading when already marked connected recently
+        if (
+            self.connection_status == self.ConnectionStatus.CONNECTED
+            and self.last_communication
+            and (now - self.last_communication).total_seconds() < 30
+        ):
+            return
         self.connection_status = self.ConnectionStatus.CONNECTED
-        self.last_communication = timezone.now()
+        self.last_communication = now
         self.save(update_fields=["connection_status", "last_communication", "updated_at"])
 
     def set_api_key(self, raw_key: str):
