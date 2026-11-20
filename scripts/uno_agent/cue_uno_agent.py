@@ -291,7 +291,7 @@ def heartbeat_ok(cfg: dict) -> None:
 
 
 def poll_valve_commands(cfg: dict, ser: serial.Serial) -> None:
-    """Pull pending commands from every target; first success wins per command id."""
+    """Pull pending commands; clear AUTO/MANUAL; only TX the newest OPEN/CLOSE."""
     seen: set[Any] = set()
     for target in cfg["targets"]:
         r = _get_one(target, "/iot/commands/pending/")
@@ -302,15 +302,52 @@ def poll_valve_commands(cfg: dict, ser: serial.Serial) -> None:
         except Exception:
             continue
         data = body.get("data") or body
-        cmds = (data or {}).get("commands") or []
+        cmds = list((data or {}).get("commands") or [])
+        if not cmds:
+            continue
+
+        cmds.sort(key=lambda c: c.get("requested_at") or "", reverse=True)
+        latest_physical_id = None
+        for cmd in cmds:
+            action = (cmd.get("command_type") or "").upper()
+            if action in {"CLOSE", "OPEN"}:
+                latest_physical_id = cmd.get("id")
+                break
+
         for cmd in cmds:
             cid = cmd.get("id")
             action = (cmd.get("command_type") or "").upper()
-            if not cid or cid in seen or action not in {"CLOSE", "OPEN"}:
+            if not cid or cid in seen:
                 continue
             seen.add(cid)
             if cmd.get("valve_id"):
                 cfg["_valve_id"] = int(cmd["valve_id"])
+
+            # Mode changes are software-only — must not sit PENDING forever
+            if action in {"AUTO", "MANUAL", "SET_MODE_AUTO", "SET_MODE_MANUAL"}:
+                _post_one(target, f"/iot/commands/{cid}/acknowledge/", {})
+                _post_one(
+                    target,
+                    f"/iot/commands/{cid}/execute/",
+                    {"success": True, "message": f"Mode set to {action} (no serial)"},
+                )
+                log.info("[%s] mode %s (command %s)", target["name"], action, cid)
+                continue
+
+            if action not in {"CLOSE", "OPEN"}:
+                continue
+
+            # Only the newest physical command gets serial; expire the rest
+            if latest_physical_id is not None and cid != latest_physical_id:
+                _post_one(target, f"/iot/commands/{cid}/acknowledge/", {})
+                _post_one(
+                    target,
+                    f"/iot/commands/{cid}/execute/",
+                    {"success": False, "message": "Superseded by newer valve command"},
+                )
+                log.info("[%s] expired stale %s (command %s)", target["name"], action, cid)
+                continue
+
             _post_one(target, f"/iot/commands/{cid}/acknowledge/", {})
             line = "CLOSE" if action == "CLOSE" else "RESET"
             try:

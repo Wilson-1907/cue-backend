@@ -4,6 +4,12 @@ from .models import Valve, ValveCommand
 from activity_logs.services import log_action
 from notifications.services import create_notification
 
+_OPEN_QUEUE = {
+    ValveCommand.CommandType.OPEN,
+    ValveCommand.CommandType.CLOSE,
+}
+
+
 @transaction.atomic
 def request_command(valve: Valve, command_type: str, user=None,
                     idempotency_key: str = "") -> ValveCommand:
@@ -12,6 +18,39 @@ def request_command(valve: Valve, command_type: str, user=None,
                                                idempotency_key=idempotency_key).first()
         if existing:
             return existing
+
+    # Reuse an identical in-flight command instead of stacking PENDING spam
+    active = ValveCommand.objects.filter(
+        valve=valve,
+        command_type=command_type,
+        execution_status__in=[
+            ValveCommand.ExecutionStatus.PENDING,
+            ValveCommand.ExecutionStatus.RECEIVED,
+        ],
+    ).order_by("-requested_at").first()
+    if active:
+        return active
+
+    # New OPEN/CLOSE supersedes the opposite still waiting in queue
+    if command_type in _OPEN_QUEUE:
+        opposite = (
+            ValveCommand.CommandType.CLOSE
+            if command_type == ValveCommand.CommandType.OPEN
+            else ValveCommand.CommandType.OPEN
+        )
+        ValveCommand.objects.filter(
+            valve=valve,
+            command_type=opposite,
+            execution_status__in=[
+                ValveCommand.ExecutionStatus.PENDING,
+                ValveCommand.ExecutionStatus.RECEIVED,
+            ],
+        ).update(
+            execution_status=ValveCommand.ExecutionStatus.EXPIRED,
+            response_message="Superseded by newer command",
+            executed_at=timezone.now(),
+        )
+
     cmd = ValveCommand.objects.create(
         valve=valve, command_type=command_type, requested_by=user,
         idempotency_key=idempotency_key,
