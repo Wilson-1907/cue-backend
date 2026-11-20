@@ -45,6 +45,13 @@ class Device(TimeStampedModel):
         self.last_communication = now
         self.save(update_fields=["connection_status", "last_communication", "updated_at"])
 
+    def mark_disconnected(self):
+        """Immediate OFFLINE — do not treat as fresh heartbeat."""
+        if self.connection_status == self.ConnectionStatus.DISCONNECTED:
+            return
+        self.connection_status = self.ConnectionStatus.DISCONNECTED
+        self.save(update_fields=["connection_status", "updated_at"])
+
     def set_api_key(self, raw_key: str):
         from django.contrib.auth.hashers import make_password
         self.api_key_hash = make_password(raw_key)

@@ -1,11 +1,26 @@
 {
-  "api_base": "https://YOUR_CONTABO_IP_OR_DOMAIN/api/v1",
-  "device_id": "UNO-KIT-001",
-  "api_key": "PASTE_KEY_FROM_provision_uno_agent",
+  "port": "COM10",
   "baud": 9600,
   "sensor_inlet": "S1",
   "sensor_outlet": "S2",
   "scan_interval_sec": 2,
-  "prefer_vid": true,
-  "port": ""
+  "valve_id": 1,
+  "targets": [
+    {
+      "name": "render",
+      "api_base": "https://YOUR_SERVICE.onrender.com/api/v1",
+      "device_id": "UNO-KIT-001",
+      "api_key": "PASTE_CLOUD_KEY",
+      "valve_id": 1,
+      "enabled": true
+    },
+    {
+      "name": "local",
+      "api_base": "http://127.0.0.1:8000/api/v1",
+      "device_id": "UNO-KIT-001",
+      "api_key": "PASTE_LOCAL_KEY",
+      "valve_id": 1,
+      "enabled": true
+    }
+  ]
 }

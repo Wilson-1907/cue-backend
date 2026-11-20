@@ -1,13 +1,10 @@
 #!/usr/bin/env python3
 """
-CUE Uno Agent — always-on USB bridge for Contabo / any CUE API host.
+CUE Uno Agent — USB bridge locked to COM10.
 
-- Watches for Arduino/Uno (or any serial adapter) on ANY COM port
-- Auto-connects when you plug the cable in
-- Reconnects forever if unplugged / port changes
-- Posts flow readings + valve commands to the CUE HTTP API
-
-Run once at login (see install_windows_autostart.ps1).
+Posts the same kit telemetry to every configured API target
+(e.g. Render cloud + localhost) so online and local dashboards stay in sync.
+Never scans Bluetooth/AMT/other COM ports.
 """
 
 from __future__ import annotations
@@ -20,6 +17,7 @@ import time
 from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
+from typing import Any
 
 try:
     import requests
@@ -56,17 +54,6 @@ ESTIMATE_RE = re.compile(
     r":(?P<qin>[-+]?\d*\.?\d+):(?P<qout>[-+]?\d*\.?\d+):(?P<band>\d+)\s*$"
 )
 
-# Common Arduino / USB-serial chip vendor IDs
-ARDUINO_VIDS = {
-    0x2341,  # Arduino
-    0x2A03,  # Arduino.org
-    0x1A86,  # CH340
-    0x0403,  # FTDI
-    0x10C4,  # CP210x
-    0x067B,  # Prolific
-}
-
-
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -77,62 +64,78 @@ logging.basicConfig(
 )
 log = logging.getLogger("cue_uno_agent")
 
+# Per-target: None=unknown, True=disconnect API works, False=old server
+_OFFLINE_API_OK: dict[str, bool | None] = {}
+
 
 def load_config() -> dict:
     if not CONFIG_PATH.exists():
         example = HERE / "config.example.json"
         raise SystemExit(
-            f"Missing {CONFIG_PATH}. Copy {example.name} → config.json and fill api_base + api_key."
+            f"Missing {CONFIG_PATH}. Copy {example.name} -> config.json and fill targets."
         )
-    cfg = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
-    if not cfg.get("api_base") or not cfg.get("api_key") or not cfg.get("device_id"):
-        raise SystemExit("config.json needs api_base, device_id, and api_key")
-    cfg["api_base"] = cfg["api_base"].rstrip("/")
-    cfg.setdefault("baud", 9600)
-    cfg.setdefault("sensor_inlet", "S1")
-    cfg.setdefault("sensor_outlet", "S2")
-    cfg.setdefault("scan_interval_sec", 2)
-    cfg.setdefault("prefer_vid", True)
+    raw = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+
+    targets: list[dict[str, Any]] = []
+    if isinstance(raw.get("targets"), list) and raw["targets"]:
+        for t in raw["targets"]:
+            if not t.get("api_base") or not t.get("api_key") or not t.get("device_id"):
+                raise SystemExit("Each targets[] entry needs api_base, device_id, api_key")
+            targets.append(
+                {
+                    "name": t.get("name") or t["api_base"],
+                    "api_base": str(t["api_base"]).rstrip("/"),
+                    "device_id": t["device_id"],
+                    "api_key": t["api_key"],
+                    "valve_id": int(t.get("valve_id") or raw.get("valve_id") or 1),
+                    "enabled": t.get("enabled", True),
+                }
+            )
+    else:
+        if not raw.get("api_base") or not raw.get("api_key") or not raw.get("device_id"):
+            raise SystemExit("config.json needs api_base/device_id/api_key or targets[]")
+        targets.append(
+            {
+                "name": "primary",
+                "api_base": str(raw["api_base"]).rstrip("/"),
+                "device_id": raw["device_id"],
+                "api_key": raw["api_key"],
+                "valve_id": int(raw.get("valve_id") or 1),
+                "enabled": True,
+            }
+        )
+
+    cfg = {
+        "port": (raw.get("port") or "COM10").strip() or "COM10",
+        "baud": int(raw.get("baud") or 9600),
+        "sensor_inlet": raw.get("sensor_inlet") or "S1",
+        "sensor_outlet": raw.get("sensor_outlet") or "S2",
+        "scan_interval_sec": float(raw.get("scan_interval_sec") or 2),
+        "targets": [t for t in targets if t.get("enabled", True)],
+        "_valve_id": int(raw.get("valve_id") or 1),
+    }
+    if not cfg["targets"]:
+        raise SystemExit("No enabled API targets in config.json")
     return cfg
 
 
-def headers(cfg: dict) -> dict:
+def headers(target: dict) -> dict:
     return {
         "Content-Type": "application/json",
-        "X-Device-Id": cfg["device_id"],
-        "X-Api-Key": cfg["api_key"],
+        "X-Device-Id": target["device_id"],
+        "X-Api-Key": target["api_key"],
     }
 
 
-def list_candidate_ports(prefer_vid: bool = True) -> list[str]:
-    ports = list(list_ports.comports())
-    if not ports:
-        return []
-    scored: list[tuple[int, str]] = []
-    for p in ports:
-        score = 0
-        desc = f"{p.description or ''} {p.manufacturer or ''} {p.product or ''}".lower()
-        if prefer_vid and p.vid and int(p.vid) in ARDUINO_VIDS:
-            score += 100
-        if any(k in desc for k in ("arduino", "ch340", "uno", "usb serial", "cp210", "ftdi")):
-            score += 50
-        if p.device:
-            scored.append((score, p.device))
-    scored.sort(key=lambda x: (-x[0], x[1]))
-    # Prefer high-score first, but still try all ports
-    ordered = [d for _, d in scored]
-    # Deduplicate
-    seen = set()
-    out = []
-    for d in ordered:
-        if d not in seen:
-            seen.add(d)
-            out.append(d)
-    return out
+def port_present(port: str) -> bool:
+    want = port.upper().strip()
+    for p in list_ports.comports():
+        if (p.device or "").upper() == want:
+            return True
+    return False
 
 
-def probe_port(port: str, baud: int, timeout: float = 2.5) -> bool:
-    """Open briefly; treat success as usable (firmware may be quiet until flow)."""
+def probe_port(port: str, baud: int, timeout: float = 2.0) -> bool:
     try:
         with serial.Serial(port, baud, timeout=0.3) as ser:
             deadline = time.time() + timeout
@@ -143,132 +146,200 @@ def probe_port(port: str, baud: int, timeout: float = 2.5) -> bool:
                 text = raw.decode("utf-8", errors="replace")
                 if FLOW_RE.search(text) or "S1" in text or "Inlet" in text or "CUE" in text.upper():
                     return True
-            # Port opened OK even if quiet — accept as candidate if VID matched earlier
             return True
     except Exception:
         return False
 
 
 def find_uno_port(cfg: dict) -> str | None:
-    forced = (cfg.get("port") or "").strip()
-    # Locked port: never fall through to Bluetooth/AMT COM ports
-    if forced:
-        log.info("Probing locked port %s …", forced)
-        if probe_port(forced, int(cfg["baud"])):
-            return forced
+    forced = cfg["port"]
+    if not port_present(forced):
+        log.info("Locked port %s not present", forced)
+        return None
+    # Listed as present — open in session_on_port (separate probe can false-fail if busy)
+    log.info("Using locked port %s", forced)
+    return forced
+
+
+def _post_one(
+    target: dict, path: str, payload: dict, timeout: float = 12
+) -> requests.Response | None:
+    url = target["api_base"] + path
+    try:
+        r = requests.post(url, headers=headers(target), json=payload, timeout=timeout)
+        if r.status_code >= 400:
+            log.warning(
+                "[%s] POST %s -> %s %s",
+                target["name"],
+                path,
+                r.status_code,
+                r.text[:160],
+            )
+        return r
+    except Exception as exc:
+        log.warning("[%s] POST %s failed: %s", target["name"], path, exc)
         return None
 
-    candidates = list_candidate_ports(cfg.get("prefer_vid", True))
-    if not candidates:
+
+def _get_one(target: dict, path: str, timeout: float = 10) -> requests.Response | None:
+    url = target["api_base"] + path
+    try:
+        r = requests.get(url, headers=headers(target), timeout=timeout)
+        if r.status_code >= 400:
+            log.warning(
+                "[%s] GET %s -> %s %s",
+                target["name"],
+                path,
+                r.status_code,
+                r.text[:160],
+            )
+        return r
+    except Exception as exc:
+        log.warning("[%s] GET %s failed: %s", target["name"], path, exc)
         return None
-    for port in candidates:
-        log.info("Probing %s …", port)
-        if probe_port(port, int(cfg["baud"])):
-            return port
-    return None
 
 
-def post_reading(cfg: dict, sensor_id: str, flow: Decimal, volume: Decimal, pulse: int) -> None:
+def fanout_post(cfg: dict, path: str, payload: dict, timeout: float = 12) -> None:
+    for target in cfg["targets"]:
+        _post_one(target, path, payload, timeout=timeout)
+
+
+def post_reading(
+    cfg: dict, sensor_id: str, flow: Decimal, volume: Decimal, pulse: int
+) -> None:
     ts = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-    payload = {
-        "device_id": cfg["device_id"],
-        "sensor_id": sensor_id,
-        "flow_rate": str(flow),
-        "volume": str(volume),
-        "pulse_count": pulse,
-        "timestamp": ts,
-    }
-    url = cfg["api_base"] + "/iot/readings/"
-    r = requests.post(url, headers=headers(cfg), json=payload, timeout=15)
-    if r.status_code >= 400:
-        log.warning("reading POST %s → %s %s", sensor_id, r.status_code, r.text[:200])
+    for target in cfg["targets"]:
+        payload = {
+            "device_id": target["device_id"],
+            "sensor_id": sensor_id,
+            "flow_rate": str(flow),
+            "volume": str(volume),
+            "pulse_count": pulse,
+            "timestamp": ts,
+        }
+        _post_one(target, "/iot/readings/", payload, timeout=15)
 
 
 def post_warning(cfg: dict, title: str, message: str, severity: str = "CRITICAL") -> None:
-    url = cfg["api_base"] + "/iot/devices/warnings/"
-    try:
-        requests.post(
-            url,
-            headers=headers(cfg),
-            json={"title": title, "message": message, "severity": severity},
-            timeout=15,
-        )
-    except Exception:
-        log.exception("warning POST failed")
-
-
-def _post_json(cfg: dict, path: str, payload: dict, timeout: float = 12) -> requests.Response | None:
-    url = cfg["api_base"].rstrip("/") + path
-    try:
-        r = requests.post(url, headers=headers(cfg), json=payload, timeout=timeout)
-        if r.status_code >= 400:
-            log.warning("POST %s → %s %s", path, r.status_code, r.text[:200])
-        return r
-    except Exception:
-        log.exception("POST %s failed", path)
-        return None
+    fanout_post(
+        cfg,
+        "/iot/devices/warnings/",
+        {"title": title, "message": message, "severity": severity},
+    )
 
 
 def report_valve_status(cfg: dict, status: str) -> None:
-    """Push OPEN/CLOSED confirmed by firmware serial text."""
     status = status.upper().strip()
     if status not in {"OPEN", "CLOSED"}:
         return
-    vid = cfg.get("_valve_id") or cfg.get("valve_id") or 1
-    cfg["_valve_id"] = int(vid)
-    _post_json(cfg, f"/iot/valves/{cfg['_valve_id']}/status/", {"status": status})
+    for target in cfg["targets"]:
+        vid = int(target.get("valve_id") or cfg.get("_valve_id") or 1)
+        cfg["_valve_id"] = vid
+        _post_one(target, f"/iot/valves/{vid}/status/", {"status": status})
+
+
+def report_offline(cfg: dict, note: str = "COM port disconnected") -> None:
+    """Mark kit offline on every target that supports disconnect heartbeats."""
+    for target in cfg["targets"]:
+        key = target["api_base"]
+        if _OFFLINE_API_OK.get(key) is False:
+            continue
+        r = _post_one(
+            target,
+            "/iot/heartbeat/",
+            {
+                "device_id": target["device_id"],
+                "status": "DISCONNECTED",
+                "firmware_version": "uno-agent",
+            },
+        )
+        if r is None:
+            continue
+        try:
+            body = r.json() if r.content else {}
+            conn = (body.get("data") or {}).get("connection_status")
+            if conn == "DISCONNECTED" or "Disconnect" in (body.get("message") or ""):
+                _OFFLINE_API_OK[key] = True
+                _post_one(
+                    target,
+                    "/iot/devices/status/",
+                    {"status": "DISCONNECTED", "note": note},
+                )
+                log.info("[%s] Reported OFFLINE (%s)", target["name"], note)
+                continue
+        except Exception:
+            pass
+        _OFFLINE_API_OK[key] = False
+        log.warning(
+            "[%s] disconnect heartbeat not supported yet — relying on timeout (%s)",
+            target["name"],
+            note,
+        )
+
+
+def heartbeat_ok(cfg: dict) -> None:
+    for target in cfg["targets"]:
+        _post_one(
+            target,
+            "/iot/heartbeat/",
+            {
+                "device_id": target["device_id"],
+                "status": "OK",
+                "firmware_version": "uno-agent",
+            },
+        )
 
 
 def poll_valve_commands(cfg: dict, ser: serial.Serial) -> None:
-    url = cfg["api_base"].rstrip("/") + "/iot/commands/pending/"
-    try:
-        r = requests.get(url, headers=headers(cfg), timeout=10)
-        if r.status_code >= 400:
-            log.warning("pending commands → %s %s", r.status_code, r.text[:200])
-            return
-        body = r.json()
+    """Pull pending commands from every target; first success wins per command id."""
+    seen: set[Any] = set()
+    for target in cfg["targets"]:
+        r = _get_one(target, "/iot/commands/pending/")
+        if r is None or r.status_code >= 400:
+            continue
+        try:
+            body = r.json()
+        except Exception:
+            continue
         data = body.get("data") or body
         cmds = (data or {}).get("commands") or []
         for cmd in cmds:
-            action = (cmd.get("command_type") or "").upper()
             cid = cmd.get("id")
-            if action not in {"CLOSE", "OPEN"} or not cid:
+            action = (cmd.get("command_type") or "").upper()
+            if not cid or cid in seen or action not in {"CLOSE", "OPEN"}:
                 continue
+            seen.add(cid)
             if cmd.get("valve_id"):
                 cfg["_valve_id"] = int(cmd["valve_id"])
-            # Mark received so UI leaves PENDING quickly
-            _post_json(cfg, f"/iot/commands/{cid}/acknowledge/", {})
+            _post_one(target, f"/iot/commands/{cid}/acknowledge/", {})
             line = "CLOSE" if action == "CLOSE" else "RESET"
             try:
                 ser.write((line + "\r\n").encode())
                 ser.flush()
-                log.info("TX %s (command %s)", line, cid)
+                log.info("[%s] TX %s (command %s)", target["name"], line, cid)
             except Exception:
                 log.exception("serial TX failed for command %s", cid)
-                _post_json(
-                    cfg,
+                _post_one(
+                    target,
                     f"/iot/commands/{cid}/execute/",
                     {"success": False, "message": "Serial write failed"},
                 )
                 continue
-            # Confirm to API (retry once — free Render can 502 briefly)
             ok = False
-            for attempt in range(2):
-                resp = _post_json(
-                    cfg,
+            for _ in range(2):
+                resp = _post_one(
+                    target,
                     f"/iot/commands/{cid}/execute/",
                     {"success": True, "message": f"Sent {line} to Uno"},
                 )
                 if resp is not None and resp.status_code < 400:
                     ok = True
                     break
-                time.sleep(1.5)
+                time.sleep(1.2)
             if ok:
                 report_valve_status(cfg, "CLOSED" if action == "CLOSE" else "OPEN")
             else:
-                log.error("execute confirm failed for command %s — will retry while PENDING", cid)
-    except Exception:
-        log.exception("valve poll failed")
+                log.error("execute confirm failed for command %s", cid)
 
 
 def session_on_port(cfg: dict, port: str) -> None:
@@ -282,26 +353,15 @@ def session_on_port(cfg: dict, port: str) -> None:
     last_heartbeat = 0.0
 
     with serial.Serial(port, baud, timeout=0.25) as ser:
-        log.info("Connected %s @ %s — streaming to %s", port, baud, cfg["api_base"])
-
-        def heartbeat() -> None:
-            _post_json(
-                cfg,
-                "/iot/heartbeat/",
-                {
-                    "device_id": cfg["device_id"],
-                    "status": "OK",
-                    "firmware_version": "uno-agent",
-                },
-            )
-
-        heartbeat()
+        names = ", ".join(t["name"] for t in cfg["targets"])
+        log.info("Connected %s @ %s — streaming to: %s", port, baud, names)
+        heartbeat_ok(cfg)
         last_heartbeat = time.time()
 
         while True:
             now = time.time()
             if now - last_heartbeat >= 25.0:
-                heartbeat()
+                heartbeat_ok(cfg)
                 last_heartbeat = now
             if now - last_cmd_poll > 2.0:
                 poll_valve_commands(cfg, ser)
@@ -315,7 +375,6 @@ def session_on_port(cfg: dict, port: str) -> None:
                 continue
             log.info("SERIAL: %s", text.encode("ascii", "replace").decode("ascii"))
 
-            # Firmware confirms physical valve — keep dashboard in sync
             up = text.upper()
             if "ACK:RESET" in up or "WATER VALVE OPEN" in up or up.endswith("VALVE OPEN"):
                 report_valve_status(cfg, "OPEN")
@@ -360,7 +419,8 @@ def session_on_port(cfg: dict, port: str) -> None:
                 post_warning(
                     cfg,
                     "LEAK_ALERT from Uno",
-                    f"Zone {pending_leak['zone']} inlet={pending_leak['inlet']} outlet={pending_leak['outlet']}",
+                    f"Zone {pending_leak['zone']} inlet={pending_leak['inlet']} "
+                    f"outlet={pending_leak['outlet']}",
                     "CRITICAL",
                 )
                 pending_leak = None
@@ -384,26 +444,45 @@ def session_on_port(cfg: dict, port: str) -> None:
                 post_reading(cfg, cfg["sensor_inlet"], inlet, vol_in, pulse)
                 post_reading(cfg, cfg["sensor_outlet"], outlet, vol_out, pulse)
             except Exception:
-                log.exception("post readings failed — will keep listening")
+                log.exception("post readings failed — keep listening")
 
 
 def main() -> None:
     cfg = load_config()
-    log.info("CUE Uno Agent starting (auto any-port). Config=%s", CONFIG_PATH)
-    log.info("API=%s device=%s", cfg["api_base"], cfg["device_id"])
-    scan = float(cfg.get("scan_interval_sec", 2))
+    locked = cfg["port"]
+    log.info("CUE Uno Agent starting (locked %s only). Config=%s", locked, CONFIG_PATH)
+    for t in cfg["targets"]:
+        log.info("Target %-10s %s device=%s", t["name"], t["api_base"], t["device_id"])
+    scan = float(cfg["scan_interval_sec"])
+    was_online = False
+    last_offline_post = 0.0
 
     while True:
         try:
             port = find_uno_port(cfg)
             if not port:
-                log.info("No serial device yet — plug in the Uno (any USB port). Retry in %.0fs", scan)
+                now = time.time()
+                if was_online or (now - last_offline_post) >= 30.0:
+                    log.warning("%s missing — reporting OFFLINE", locked)
+                    report_offline(cfg, f"{locked} not present")
+                    last_offline_post = now
+                    was_online = False
+                else:
+                    log.info(
+                        "Waiting for %s only (not scanning other COM ports). Retry in %.0fs",
+                        locked,
+                        scan,
+                    )
                 time.sleep(scan)
                 continue
             try:
+                was_online = True
                 session_on_port(cfg, port)
             except serial.SerialException as exc:
-                log.warning("%s disconnected (%s) — waiting for plug…", port, exc)
+                log.warning("%s disconnected (%s) — reporting OFFLINE", port, exc)
+                report_offline(cfg, f"{port} disconnected: {exc}")
+                was_online = False
+                last_offline_post = time.time()
                 time.sleep(scan)
             except KeyboardInterrupt:
                 log.info("Stopped by user")

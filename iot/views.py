@@ -190,14 +190,21 @@ class HeartbeatView(APIView):
         serializer.is_valid(raise_exception=True)
         if serializer.validated_data["device_id"] != device.device_identifier:
             return error_response("Device identifier mismatch")
-        device.mark_connected()
+        hb_status = (serializer.validated_data.get("status") or "OK").upper()
+        offline = hb_status in {"DISCONNECTED", "OFFLINE", "ERROR", "DOWN"}
+        if offline:
+            device.mark_disconnected()
+        else:
+            device.mark_connected()
         if serializer.validated_data.get("firmware_version"):
             device.firmware_version = serializer.validated_data["firmware_version"]
             device.save(update_fields=["firmware_version"])
         DeviceCommunicationLog.objects.create(device=device, kind="HEARTBEAT",
                                               payload=serializer.validated_data)
-        return success_response({"server_time": __import__("django.utils.timezone", fromlist=["now"]).now()},
-                                "Heartbeat accepted")
+        msg = "Disconnect reported" if offline else "Heartbeat accepted"
+        return success_response({"server_time": __import__("django.utils.timezone", fromlist=["now"]).now(),
+                                 "connection_status": device.connection_status},
+                                msg)
 
 class DeviceRegisterView(APIView):
     permission_classes = [AllowAny]
@@ -241,10 +248,17 @@ class DeviceStatusReportView(APIView):
         device = principal[0].device
         serializer = DeviceStatusSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
-        device.mark_connected()
+        st = (serializer.validated_data.get("status") or "").upper()
+        if st in {"DISCONNECTED", "OFFLINE", "ERROR", "DOWN"}:
+            device.mark_disconnected()
+        else:
+            device.mark_connected()
         DeviceCommunicationLog.objects.create(device=device, kind="STATUS",
                                               payload=serializer.validated_data)
-        return success_response({"acknowledged": True})
+        return success_response({
+            "acknowledged": True,
+            "connection_status": device.connection_status,
+        })
 
 class DeviceWarningView(APIView):
     permission_classes = [AllowAny]

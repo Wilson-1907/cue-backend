@@ -25,7 +25,11 @@ def seconds_since(dt) -> int | None:
 
 
 def effective_connection(device) -> str:
-    """CONNECTED only if last_communication is within heartbeat timeout."""
+    """CONNECTED only if marked connected and last_communication is fresh."""
+    from .models import Device
+
+    if device.connection_status == Device.ConnectionStatus.DISCONNECTED:
+        return "DISCONNECTED"
     timeout = heartbeat_timeout_seconds()
     age = seconds_since(device.last_communication)
     if age is None:
